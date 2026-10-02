@@ -2,12 +2,17 @@
 #include <PN532_HSU.h>
 #include <PN532.h>
 #include <ArduinoJson.h>
+#include <RpcServer.h>
+#include <RpcSerialTransport.h>
 
 const char* ssid     = "your wifi name";
 const char* password = "password";
 
 WiFiServer tcpServer(8080);
 WiFiClient client;
+
+RpcServer<8> rpc;
+StaticJsonDocument<512> rpcResultDoc;
 
 PN532_HSU pn532hsu(Serial1);
 PN532 nfc(pn532hsu);
@@ -42,6 +47,8 @@ void setup() {
 
   tcpServer.begin();
   Serial.println("NTAG215 JSON-RPC Server started on port 8080");
+
+  setupRpcMethods();
 }
 
 // ฟังก์ชันเขียน NDEF Record พร้อมล้างข้อมูลเก่าและใส่ Terminator (0xFE) ให้ถูกต้อง
@@ -217,6 +224,108 @@ bool readNdefFromNtag(String &outType, String &outContent) {
   return true;
 }
 
+void setupRpcMethods() {
+  rpc.addMethod("ping", []() -> JsonVariant {
+    rpcResultDoc.clear();
+    rpcResultDoc["status"] = "success";
+    rpcResultDoc["message"] = "pong";
+    return rpcResultDoc.as<JsonVariant>();
+  });
+
+  rpc.addMethod("read", [](JsonVariantConst params) -> JsonVariant {
+    (void)params;
+    rpcResultDoc.clear();
+
+    uint8_t check_uid[7];
+    uint8_t check_len;
+    bool cardDetectedNow = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, check_uid, &check_len, NFC_READ_TIMEOUT_MS);
+    
+    if (cardDetectedNow) {
+      tagPresent = true;
+      lastSeenTime = millis();
+      String tempStr = "";
+      for (uint8_t i = 0; i < check_len; i++) {
+        if (check_uid[i] < 0x10) tempStr += "0";
+        tempStr += String(check_uid[i], HEX);
+      }
+      tempStr.toUpperCase();
+      currentUidStr = tempStr;
+    }
+
+    if (tagPresent && currentUidStr != "") {
+      rpcResultDoc["status"] = "success";
+      rpcResultDoc["uid"] = currentUidStr;
+
+      String ndefType, ndefContent;
+      if (readNdefFromNtag(ndefType, ndefContent)) {
+        rpcResultDoc["content_type"] = ndefType;
+        rpcResultDoc["content"] = ndefContent;
+        rpcResultDoc["message"] = "Read NDEF successfully";
+      } else {
+        rpcResultDoc["content_type"] = "error";
+        rpcResultDoc["content"] = "";
+        rpcResultDoc["message"] = "Failed to read NDEF content";
+      }
+    } else {
+      rpcResultDoc["status"] = "error";
+      rpcResultDoc["message"] = "No NTAG tag detected. Please place tag on reader.";
+    }
+
+    return rpcResultDoc.as<JsonVariant>();
+  });
+
+  rpc.addMethod("write", [](JsonVariantConst params) -> JsonVariant {
+    rpcResultDoc.clear();
+
+    uint8_t check_uid[7];
+    uint8_t check_len;
+    bool cardDetectedNow = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, check_uid, &check_len, NFC_READ_TIMEOUT_MS);
+    
+    if (cardDetectedNow) {
+      tagPresent = true;
+      lastSeenTime = millis();
+      String tempStr = "";
+      for (uint8_t i = 0; i < check_len; i++) {
+        if (check_uid[i] < 0x10) tempStr += "0";
+        tempStr += String(check_uid[i], HEX);
+      }
+      tempStr.toUpperCase();
+      currentUidStr = tempStr;
+    }
+
+    if (tagPresent && currentUidStr != "") {
+      String dataToWrite = params["data"] | "";
+      String recordType = params["type"] | "";
+
+      bool looksLikeUri = dataToWrite.startsWith("http://")  ||
+                           dataToWrite.startsWith("https://") ||
+                           dataToWrite.startsWith("www.")     ||
+                           dataToWrite.startsWith("tel:")     ||
+                           dataToWrite.startsWith("mailto:");
+
+      bool asUri;
+      if (recordType == "uri") asUri = true;
+      else if (recordType == "text") asUri = false;
+      else asUri = looksLikeUri;
+
+      bool ok = asUri ? writeNdefUriToNtag(dataToWrite) : writeNdefTextToNtag(dataToWrite);
+
+      if (ok) {
+        rpcResultDoc["status"] = "success";
+        rpcResultDoc["message"] = "Written to NTAG215: " + dataToWrite;
+      } else {
+        rpcResultDoc["status"] = "error";
+        rpcResultDoc["message"] = "Failed to write NDEF data";
+      }
+    } else {
+      rpcResultDoc["status"] = "error";
+      rpcResultDoc["message"] = "No NTAG tag detected. Please place tag on reader.";
+    }
+
+    return rpcResultDoc.as<JsonVariant>();
+  });
+}
+
 void loop() {
   if (!client || !client.connected()) {
     WiFiClient newClient = tcpServer.available();
@@ -253,88 +362,11 @@ void loop() {
   }
 
   if (client && client.connected() && client.available()) {
-    String requestString = client.readStringUntil('\n');
-    requestString.trim();
-
-    if (requestString.length() > 0) {
-      Serial.println("Received RPC: " + requestString);
-
-      StaticJsonDocument<256> doc;
-      DeserializationError error = deserializeJson(doc, requestString);
-
-      if (!error) {
-        String action = doc["action"];
-        StaticJsonDocument<512> responseDoc;
-
-        uint8_t check_uid[7];
-        uint8_t check_len;
-        bool cardDetectedNow = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, check_uid, &check_len, NFC_READ_TIMEOUT_MS);
-        
-        if (cardDetectedNow) {
-          tagPresent = true;
-          lastSeenTime = millis();
-          String tempStr = "";
-          for (uint8_t i = 0; i < check_len; i++) {
-            if (check_uid[i] < 0x10) tempStr += "0";
-            tempStr += String(check_uid[i], HEX);
-          }
-          tempStr.toUpperCase();
-          currentUidStr = tempStr;
-        }
-
-        if (tagPresent && currentUidStr != "") {
-          if (action == "read") {
-            responseDoc["status"] = "success";
-            responseDoc["uid"] = currentUidStr;
-
-            String ndefType, ndefContent;
-            if (readNdefFromNtag(ndefType, ndefContent)) {
-              responseDoc["content_type"] = ndefType;
-              responseDoc["content"] = ndefContent;
-              responseDoc["message"] = "Read NDEF successfully";
-            } else {
-              responseDoc["content_type"] = "error";
-              responseDoc["content"] = "";
-              responseDoc["message"] = "Failed to read NDEF content";
-            }
-          }
-          else if (action == "write") {
-            String dataToWrite = doc["data"];
-            String recordType = doc["type"] | "";
-
-            bool looksLikeUri = dataToWrite.startsWith("http://")  ||
-                                 dataToWrite.startsWith("https://") ||
-                                 dataToWrite.startsWith("www.")     ||
-                                 dataToWrite.startsWith("tel:")     ||
-                                 dataToWrite.startsWith("mailto:");
-
-            bool asUri;
-            if (recordType == "uri") asUri = true;
-            else if (recordType == "text") asUri = false;
-            else asUri = looksLikeUri;
-
-            bool ok = asUri ? writeNdefUriToNtag(dataToWrite) : writeNdefTextToNtag(dataToWrite);
-
-            if (ok) {
-              responseDoc["status"] = "success";
-              responseDoc["message"] = "Written to NTAG215: " + dataToWrite;
-            } else {
-              responseDoc["status"] = "error";
-              responseDoc["message"] = "Failed to write NDEF data";
-            }
-          } else {
-            responseDoc["status"] = "error";
-            responseDoc["message"] = "Unknown action";
-          }
-        } else {
-          responseDoc["status"] = "error";
-          responseDoc["message"] = "No NTAG tag detected. Please place tag on reader.";
-        }
-
-        String responseString;
-        serializeJson(responseDoc, responseString);
-        client.println(responseString);
-      }
+    RpcSerialTransport transport(client);
+    String response = rpc.handleRequest(transport);
+    if (response.length() > 0) {
+      Serial.println("RPC Response: " + response);
+      transport.write(response);
     }
   }
 }

@@ -103,6 +103,7 @@ class RPCPyQtClientApp(QWidget):
   def __init__(self):
     super().__init__()
     self.client_thread = None
+    self.rpc_id = 0
     self.initUI()
 
   def initUI(self):
@@ -186,14 +187,24 @@ class RPCPyQtClientApp(QWidget):
       self.write_btn.setEnabled(False)
 
   def send_rpc(self, action):
+    self.rpc_id += 1
     if action == "read":
-      payload = {"action": "read"}
+      payload = {
+          "jsonrpc": "2.0",
+          "method": "read",
+          "id": self.rpc_id,
+      }
     elif action == "write":
-      payload = {"action": "write", "data": self.data_input.text()}
+      payload = {
+          "jsonrpc": "2.0",
+          "method": "write",
+          "params": {"data": self.data_input.text()},
+          "id": self.rpc_id,
+      }
     else:
       return
 
-    self.log_view.append(f"Sending RPC -> {payload}")
+    self.log_view.append(f"Sending JSON-RPC 2.0 -> {payload}")
     if self.client_thread and self.client_thread.isRunning():
       self.client_thread.send_command(payload)
 
@@ -201,11 +212,25 @@ class RPCPyQtClientApp(QWidget):
     try:
       res_json = json.loads(response)
       self.log_view.append(f"Response: {res_json}")
-      # >>> NEW: ถ้ามีเนื้อหา NDEF ที่ถอดได้ ให้โชว์แยกให้เห็นชัดๆ
-      if "content" in res_json:
-        content_type = res_json.get("content_type", "unknown")
-        content = res_json.get("content", "")
-        self.log_view.append(f"  -> [{content_type}] {content}")
+
+      if "result" in res_json:
+        result = res_json["result"]
+        if isinstance(result, dict):
+          status = result.get("status", "")
+          msg = result.get("message", "")
+          if status:
+            self.log_view.append(f"  -> [{status.upper()}] {msg}")
+          if "content" in result:
+            content_type = result.get("content_type", "unknown")
+            content = result.get("content", "")
+            self.log_view.append(f"  -> [{content_type}] {content}")
+        else:
+          self.log_view.append(f"  -> Result: {result}")
+      elif "error" in res_json:
+        err = res_json["error"]
+        err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+        self.log_view.append(f"  -> [RPC Error] {err_msg}")
+
       self.log_view.append("-" * 30)
     except Exception:
       self.log_view.append(f"Raw Response: {response}\n" + "-" * 30)
